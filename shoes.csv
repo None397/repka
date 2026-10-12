@@ -1,0 +1,822 @@
+модуль1
+import psycopg2
+import pandas as pd
+from pathlib import Path
+
+DB_CONFIG = dict(
+    dbname="localhost",
+    user="postgres",
+    password="1234",   
+    host="localhost",
+)
+
+IMPORT_DIR = Path(__file__).parent / "import"
+
+
+def get_connection():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def import_lookup_table(cur, csv_name: str, table: str, column: str):
+    """Загружает простой справочник (одна колонка с уникальными названиями)."""
+    df = pd.read_csv(IMPORT_DIR / csv_name, encoding="utf-8")
+    for _, row in df.iterrows():
+        cur.execute(
+            f"""
+            INSERT INTO {table} ({column})
+            VALUES (%s)
+            ON CONFLICT ({column}) DO NOTHING
+            """,
+            (row[column],),
+        )
+
+
+def get_id_map(cur, table: str, id_column: str, name_column: str) -> dict:
+    """Возвращает словарь {название: id} для быстрого поиска внешнего ключа по имени."""
+    cur.execute(f"SELECT {id_column}, {name_column} FROM {table}")
+    return {name: row_id for row_id, name in cur.fetchall()}
+
+
+def import_products(cur):
+    df = pd.read_csv(IMPORT_DIR / "products.csv", encoding="utf-8")
+
+    categories = get_id_map(cur, "categories", "category_id", "category_name")
+    manufacturers = get_id_map(cur, "manufacturers", "manufacturer_id", "manufacturer_name")
+    suppliers = get_id_map(cur, "suppliers", "supplier_id", "supplier_name")
+
+    for _, row in df.iterrows():
+        cur.execute(
+            """
+            INSERT INTO products
+                (product_name, category_id, manufacturer_id, supplier_id,
+                 price, quantity_in_stock, discount_percent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                row["product_name"],
+                categories[row["category_name"]],
+                manufacturers[row["manufacturer_name"]],
+                suppliers[row["supplier_name"]],
+                row["price"],
+                row["quantity_in_stock"],
+                row.get("discount_percent", 0),
+            ),
+        )
+
+
+def import_users(cur):
+    df = pd.read_csv(IMPORT_DIR / "users.csv", encoding="utf-8")
+    roles = get_id_map(cur, "roles", "role_id", "role_name")
+
+    for _, row in df.iterrows():
+        cur.execute(
+            """
+            INSERT INTO users (login, password_hash, full_name, role_id)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (login) DO NOTHING
+            """,
+            (row["login"], row["password_hash"], row["full_name"], roles[row["role_name"]]),
+        )
+
+
+def import_orders(cur):
+    df = pd.read_csv(IMPORT_DIR / "orders.csv", encoding="utf-8")
+
+    products = get_id_map(cur, "products", "product_id", "product_name")
+    users = get_id_map(cur, "users", "user_id", "login")
+    statuses = get_id_map(cur, "order_statuses", "status_id", "status_name")
+
+    for _, row in df.iterrows():
+        issue_date = row.get("issue_date")
+        cur.execute(
+            """
+            INSERT INTO orders
+                (product_id, client_id, status_id, pickup_address, order_date, issue_date)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                products[row["product_name"]],
+                users[row["client_login"]],
+                statuses[row["status_name"]],
+                row["pickup_address"],
+                row["order_date"],
+                issue_date if pd.notna(issue_date) else None,
+            ),
+        )
+
+
+def main():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        # 1. Справочники — не зависят ни от кого
+        import_lookup_table(cur, "roles.csv", "roles", "role_name")
+        import_lookup_table(cur, "categories.csv", "categories", "category_name")
+        import_lookup_table(cur, "manufacturers.csv", "manufacturers", "manufacturer_name")
+        import_lookup_table(cur, "suppliers.csv", "suppliers", "supplier_name")
+        import_lookup_table(cur, "order_statuses.csv", "order_statuses", "status_name")
+        conn.commit()
+
+        import_products(cur)
+        import_users(cur)
+        conn.commit()
+
+
+        import_orders(cur)
+        conn.commit()
+
+        print("Импорт завершён успешно")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Ошибка импорта, изменения отменены: {e}")
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()
+##########################################1.sql#######################
+CREATE TABLE roles (
+role_id SERIAL PRIMARY KEY,
+role_name VARCHAR(30) NOT NULL UNIQUE
+);
+
+CREATE TABLE categories (
+category_id SERIAL PRIMARY KEY,
+category_name VARCHAR(100) NOT NULL UNIQUE
+);
+
+CREATE TABLE manufacturers (
+manufacturer_id SERIAL PRIMARY KEY,
+manufacturer_name VARCHAR(150) NOT NULL UNIQUE
+);
+
+CREATE TABLE suppliers (
+supplier_id SERIAL PRIMARY KEY,
+supplier_name VARCHAR(150) NOT NULL UNIQUE
+);
+
+CREATE TABLE order_statuses (
+
+status_id SERIAL PRIMARY KEY,
+status_name VARCHAR(50) NOT NULL UNIQUE
+);
+
+-- ===== Основные таблицы =====
+
+CREATE TABLE users (
+user_id SERIAL PRIMARY KEY,
+login VARCHAR(50) NOT NULL UNIQUE,
+password_hash VARCHAR(255) NOT NULL,
+full_name VARCHAR(150) NOT NULL,
+role_id INTEGER NOT NULL REFERENCES roles(role_id)
+);
+
+CREATE TABLE products (
+product_id SERIAL PRIMARY KEY,
+product_name VARCHAR(200) NOT NULL,
+category_id INTEGER NOT NULL REFERENCES categories(category_id),
+manufacturer_id INTEGER NOT NULL REFERENCES
+manufacturers(manufacturer_id),
+supplier_id INTEGER NOT NULL REFERENCES suppliers(supplier_id),
+price NUMERIC(10,2) NOT NULL CHECK (price >= 0),
+quantity_in_stock INTEGER NOT NULL DEFAULT 0 CHECK (quantity_in_stock >= 0),
+discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0
+CHECK (discount_percent BETWEEN 0 AND 100),
+image_path VARCHAR(255)
+);
+
+CREATE TABLE orders (
+order_id SERIAL PRIMARY KEY,
+product_id INTEGER NOT NULL REFERENCES products(product_id),
+client_id INTEGER NOT NULL REFERENCES users(user_id),
+status_id INTEGER NOT NULL REFERENCES order_statuses(status_id),
+pickup_address VARCHAR(255) NOT NULL,
+order_date DATE NOT NULL DEFAULT CURRENT_DATE,
+issue_date DATE,
+CHECK (issue_date IS NULL OR issue_date >= order_date)
+);
+####################################################################
+########################2model######################################
+#########db.py
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+DB_CONFIG = dict(
+    dbname="localhost",
+    user="postgres",
+    password="1234",  # замените на свой пароль от PostgreSQL
+    host="localhost",
+)
+
+
+def get_connection():
+    """
+    Возвращает соединение с БД.
+    cursor_factory=RealDictCursor — строки результата приходят
+    как словари {имя_колонки: значение}, а не как кортежи по индексам.
+    Так в коде экранов можно писать row["product_name"] вместо row[1].
+    """
+    return psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
+###########main.py
+import sys
+from pathlib import Path
+
+from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget
+
+from screens.login_screen import LoginScreen
+from screens.products_screen import ProductsScreen
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Магазин обуви")
+        self.resize(900, 600)
+
+        # QStackedWidget показывает только один из добавленных экранов —
+        # переключение делается через setCurrentWidget(), без пересоздания окон
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self.login_screen = LoginScreen(self.on_login_success)
+        self.products_screen = ProductsScreen()
+
+        self.stack.addWidget(self.login_screen)
+        self.stack.addWidget(self.products_screen)
+        self.stack.setCurrentWidget(self.login_screen)  # Показываем экран авторизации при старте приложения
+
+    def on_login_success(self, user: dict):
+        """
+        Callback, который LoginScreen вызовет после успешной проверки
+        логина и пароля (реализуем на шаге 4). user — словарь с данными
+        пользователя из таблицы users, включая роль.
+        """
+        self.products_screen.set_current_user(user)
+        self.stack.setCurrentWidget(self.products_screen)  # Поменяем экран на products_screen
+
+
+def load_stylesheet(app: QApplication):
+    qss_path = Path(__file__).parent / "styles.qss"
+    if qss_path.exists():
+        app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
+
+
+def main():
+    app = QApplication(sys.argv)
+    load_stylesheet(app)
+
+    window = MainWindow()
+    window.show()
+
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
+############style.qss
+QWidget {
+    background-color: #F5F6FA;
+    font-family: "Segoe UI";
+    font-size: 14px;
+    color: #1F2430;
+}
+
+QPushButton {
+    background-color: #2D6CDF;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+}
+QPushButton:hover {
+    background-color: #2559BD;
+}
+QPushButton:pressed {
+    background-color: #1F4A9E;
+}
+
+QLineEdit {
+    background-color: white;
+    border: 1px solid #E1E4EA;
+    border-radius: 4px;
+    padding: 8px 12px;
+}
+QLineEdit:focus {
+    border: 1px solid #2D6CDF;
+}
+
+QLabel#heading {
+    font-size: 20px;
+    font-weight: bold;
+}
+
+QLabel#error {
+    color: #D93025;
+    font-size: 12px;
+}
+#################screens\products_screen.py
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget
+
+from screens.product_list_page import ProductListPage
+from screens.product_form_page import ProductFormPage
+from data.products_repo import fetch_products
+
+
+class ProductsScreen(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.current_user = None
+
+        self.stack = QStackedWidget()
+
+        self.list_page = ProductListPage(on_add=self._open_add, on_edit=self._open_edit)
+        self.form_page = ProductFormPage(on_saved=self._back_to_list, on_cancel=self._back_to_list)
+
+        self.stack.addWidget(self.list_page)
+        self.stack.addWidget(self.form_page)
+        self.stack.setCurrentWidget(self.list_page)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.stack)
+        self.setLayout(layout)
+
+    def set_current_user(self, user: dict):
+        self.current_user = user
+        self.list_page.set_current_user(user)
+        self.stack.setCurrentWidget(self.list_page)
+
+    def _open_add(self):
+        self.form_page.open_for_add()
+        self.stack.setCurrentWidget(self.form_page)
+
+    def _open_edit(self, product_id):
+        product = next((p for p in fetch_products() if p["product_id"] == product_id), None)
+        if product:
+            self.form_page.open_for_edit(product)
+            self.stack.setCurrentWidget(self.form_page)
+
+    def _back_to_list(self):
+        self.list_page.reload()
+        self.stack.setCurrentWidget(self.list_page)
+##############screens\product_list_page.py
+"""
+Экран списка товаров: поиск/сортировка/фильтрация в реальном времени,
+подсветка по скидке и наличию, кнопки CRUD для менеджера/администратора.
+"""
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QComboBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView,
+)
+from PyQt6.QtCore import Qt
+
+from data.products_repo import fetch_products, fetch_lookup, delete_product
+
+
+class ProductListPage(QWidget):
+    def __init__(self, on_add, on_edit):
+        super().__init__()
+        self.on_add = on_add
+        self.on_edit = on_edit
+        self.current_user = None
+
+        self._build_ui()
+        self._load_category_filter()
+        self.reload()
+
+    def _build_ui(self):
+        layout = QVBoxLayout()
+
+        # --- поиск и фильтры ---
+        toolbar = QHBoxLayout()
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Поиск по названию...")
+        self.search_input.textChanged.connect(self.reload)  # фильтрация в реальном времени
+        toolbar.addWidget(self.search_input)
+
+        self.category_filter = QComboBox()
+        self.category_filter.currentIndexChanged.connect(self.reload)
+        toolbar.addWidget(self.category_filter)
+
+        self.sort_field = QComboBox()
+        self.sort_field.addItem("По названию", "product_name")
+        self.sort_field.addItem("По цене", "price")
+        self.sort_field.addItem("По остатку", "quantity_in_stock")
+        self.sort_field.currentIndexChanged.connect(self.reload)
+        toolbar.addWidget(self.sort_field)
+
+        self.sort_dir = QComboBox()
+        self.sort_dir.addItem("По возрастанию", "ASC")
+        self.sort_dir.addItem("По убыванию", "DESC")
+        self.sort_dir.currentIndexChanged.connect(self.reload)
+        toolbar.addWidget(self.sort_dir)
+
+        layout.addLayout(toolbar)
+
+        # --- таблица товаров ---
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Товар", "Категория", "Цена", "Остаток"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.doubleClicked.connect(self._edit_selected)
+        layout.addWidget(self.table)
+
+        # --- действия (видны только менеджеру/администратору) ---
+        actions = QHBoxLayout()
+        self.add_button = QPushButton("Добавить товар")
+        self.add_button.clicked.connect(lambda: self.on_add())
+        self.edit_button = QPushButton("Редактировать")
+        self.edit_button.clicked.connect(self._edit_selected)
+        self.delete_button = QPushButton("Удалить")
+        self.delete_button.clicked.connect(self._delete_selected)
+
+        actions.addWidget(self.add_button)
+        actions.addWidget(self.edit_button)
+        actions.addWidget(self.delete_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        self.setLayout(layout)
+
+    def _load_category_filter(self):
+        self.category_filter.addItem("Все категории", None)
+        for row in fetch_lookup("categories", "category_id", "category_name"):
+            self.category_filter.addItem(row["category_name"], row["category_id"])
+
+    def set_current_user(self, user: dict):
+        self.current_user = user
+        can_manage = user.get("role_name") in ("manager", "administrator")
+        self.add_button.setVisible(can_manage)
+        self.edit_button.setVisible(can_manage)
+        self.delete_button.setVisible(can_manage)
+        self.reload()
+
+    def reload(self):
+        try:
+            products = fetch_products(
+                search=self.search_input.text().strip(),
+                category_id=self.category_filter.currentData(),
+                sort_field=self.sort_field.currentData() or "product_name",
+                sort_dir=self.sort_dir.currentData() or "ASC",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить список товаров:\n{e}")
+            return
+
+        self.table.setRowCount(0)
+        for row_index, product in enumerate(products):
+            self.table.insertRow(row_index)
+            self.table.setItem(row_index, 0, QTableWidgetItem(product["product_name"]))
+            self.table.setItem(row_index, 1, QTableWidgetItem(product["category_name"]))
+            self.table.setItem(row_index, 2, QTableWidgetItem(f'{product["price"]} \u20bd'))
+            self.table.setItem(row_index, 3, QTableWidgetItem(str(product["quantity_in_stock"])))
+
+            # id товара храним в данных первой ячейки строки - пригодится для edit/delete
+            self.table.item(row_index, 0).setData(Qt.ItemDataRole.UserRole, product["product_id"])
+
+            if product["quantity_in_stock"] == 0:
+                for col in range(4):
+                    self.table.item(row_index, col).setForeground(Qt.GlobalColor.gray)
+            elif product["discount_percent"] and product["discount_percent"] > 0:
+                self.table.item(row_index, 2).setForeground(Qt.GlobalColor.red)
+
+    def _selected_product_id(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        return self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+
+    def _edit_selected(self):
+        product_id = self._selected_product_id()
+        if product_id is None:
+            QMessageBox.information(self, "Редактирование", "Сначала выберите товар в списке.")
+            return
+        self.on_edit(product_id)
+
+    def _delete_selected(self):
+        product_id = self._selected_product_id()
+        if product_id is None:
+            QMessageBox.information(self, "Удаление", "Сначала выберите товар в списке.")
+            return
+
+        confirm = QMessageBox.question(
+            self, "Подтверждение",
+            "Удалить выбранный товар? Это действие необратимо.",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            delete_product(product_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось удалить товар:\n{e}")
+            return
+
+        self.reload()
+###############screens\product_form_page.py
+"""
+Экран формы добавления/редактирования товара.
+Один и тот же экран используется для обоих сценариев -
+режим определяется тем, вызван ли open_for_add() или open_for_edit().
+"""
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
+    QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QPushButton, QLabel,
+)
+
+from data.products_repo import fetch_lookup, insert_product, update_product
+
+
+class ProductFormPage(QWidget):
+    def __init__(self, on_saved, on_cancel):
+        super().__init__()
+        self.on_saved = on_saved
+        self.on_cancel = on_cancel
+        self.editing_product_id = None
+
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout()
+
+        self.title_label = QLabel("Добавление товара")
+        self.title_label.setObjectName("heading")
+        layout.addWidget(self.title_label)
+
+        form = QFormLayout()
+
+        self.name_input = QLineEdit()
+        form.addRow("Название", self.name_input)
+
+        self.category_input = QComboBox()
+        form.addRow("Категория", self.category_input)
+
+        self.manufacturer_input = QComboBox()
+        form.addRow("Производитель", self.manufacturer_input)
+
+        self.supplier_input = QComboBox()
+        form.addRow("Поставщик", self.supplier_input)
+
+        self.price_input = QDoubleSpinBox()
+        self.price_input.setMaximum(1_000_000)
+        self.price_input.setDecimals(2)
+        form.addRow("Цена, \u20bd", self.price_input)
+
+        self.quantity_input = QSpinBox()
+        self.quantity_input.setMaximum(100_000)
+        form.addRow("Остаток, шт.", self.quantity_input)
+
+        self.discount_input = QSpinBox()
+        self.discount_input.setMaximum(100)
+        form.addRow("Скидка, %", self.discount_input)
+
+        layout.addLayout(form)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("error")
+        layout.addWidget(self.error_label)
+
+        buttons = QHBoxLayout()
+        self.save_button = QPushButton("Сохранить")
+        self.save_button.clicked.connect(self._save)
+        self.cancel_button = QPushButton("Отмена")
+        self.cancel_button.clicked.connect(lambda: self.on_cancel())
+        buttons.addWidget(self.save_button)
+        buttons.addWidget(self.cancel_button)
+        layout.addLayout(buttons)
+
+        self.setLayout(layout)
+
+    def open_for_add(self):
+        self.editing_product_id = None
+        self.title_label.setText("Добавление товара")
+        self._load_lookups()
+        self._clear_form()
+
+    def open_for_edit(self, product: dict):
+        self.editing_product_id = product["product_id"]
+        self.title_label.setText("Редактирование товара")
+        self._load_lookups()
+        self.name_input.setText(product["product_name"])
+        self._select_combo_value(self.category_input, product["category_id"])
+        self._select_combo_value(self.manufacturer_input, product["manufacturer_id"])
+        self._select_combo_value(self.supplier_input, product["supplier_id"])
+        self.price_input.setValue(float(product["price"]))
+        self.quantity_input.setValue(product["quantity_in_stock"])
+        self.discount_input.setValue(int(product["discount_percent"] or 0))
+        self.error_label.setText("")
+
+    def _load_lookups(self):
+        self._fill_combo(self.category_input, fetch_lookup("categories", "category_id", "category_name"), "category_id", "category_name")
+        self._fill_combo(self.manufacturer_input, fetch_lookup("manufacturers", "manufacturer_id", "manufacturer_name"), "manufacturer_id", "manufacturer_name")
+        self._fill_combo(self.supplier_input, fetch_lookup("suppliers", "supplier_id", "supplier_name"), "supplier_id", "supplier_name")
+
+    def _fill_combo(self, combo, rows, id_key, name_key):
+        combo.clear()
+        for row in rows:
+            combo.addItem(row[name_key], row[id_key])
+
+    def _select_combo_value(self, combo, value):
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _clear_form(self):
+        self.name_input.clear()
+        self.price_input.setValue(0)
+        self.quantity_input.setValue(0)
+        self.discount_input.setValue(0)
+        self.error_label.setText("")
+
+    def _validate(self):
+        if not self.name_input.text().strip():
+            return "Введите название товара"
+        if self.category_input.currentData() is None:
+            return "Выберите категорию"
+        if self.manufacturer_input.currentData() is None:
+            return "Выберите производителя"
+        if self.supplier_input.currentData() is None:
+            return "Выберите поставщика"
+        if self.price_input.value() <= 0:
+            return "Цена должна быть больше нуля"
+        return None
+
+    def _save(self):
+        error = self._validate()
+        if error:
+            self.error_label.setText(error)
+            return
+
+        data = {
+            "product_name": self.name_input.text().strip(),
+            "category_id": self.category_input.currentData(),
+            "manufacturer_id": self.manufacturer_input.currentData(),
+            "supplier_id": self.supplier_input.currentData(),
+            "price": self.price_input.value(),
+            "quantity_in_stock": self.quantity_input.value(),
+            "discount_percent": self.discount_input.value(),
+        }
+
+        try:
+            if self.editing_product_id is None:
+                insert_product(data)
+            else:
+                update_product(self.editing_product_id, data)
+        except Exception as e:
+            self.error_label.setText(f"Ошибка сохранения: {e}")
+            return
+
+        self.on_saved()
+################screens\login_screen.py
+"""
+Экран авторизации.
+
+Алгоритм полностью повторяет блок-схему из модуля 2:
+ввод логина и пароля -> поиск пользователя в БД -> проверка пароля (bcrypt)
+-> определение роли -> переход на экран товаров.
+Кроме того, можно войти как гость (без логина и пароля).
+"""
+
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QWidget, QLabel, QLineEdit, QPushButton, QVBoxLayout
+
+from db import get_connection
+
+
+class LoginScreen(QWidget):
+    def __init__(self, on_success):
+        super().__init__()
+        # on_success - функция из MainWindow, которой передаём данные пользователя
+        self.on_success = on_success
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        title = QLabel("Вход в систему")
+        title.setObjectName("heading")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        self.login_input = QLineEdit()
+        self.login_input.setPlaceholderText("Логин")
+        self.login_input.setMaximumWidth(320)
+        layout.addWidget(self.login_input, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Пароль")
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.setMaximumWidth(320)
+        self.password_input.returnPressed.connect(self._login)  # вход по Enter
+        layout.addWidget(self.password_input, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("error")
+        self.error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.error_label)
+
+        login_button = QPushButton("Войти")
+        login_button.setMaximumWidth(320)
+        login_button.clicked.connect(self._login)
+        layout.addWidget(login_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        guest_button = QPushButton("Войти как гость")
+        guest_button.setMaximumWidth(320)
+        guest_button.clicked.connect(self._login_as_guest)
+        layout.addWidget(guest_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def reset(self):
+        """Очищает форму (вызывается при выходе из учётной записи)."""
+        self.login_input.clear()
+        self.password_input.clear()
+        self.error_label.setText("")
+
+    # ---------- логика входа ----------
+
+    def _find_user(self, login: str):
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT u.user_id, u.login, u.password_hash, u.full_name, r.role_name
+                    FROM users u
+                    JOIN roles r ON r.role_id = u.role_id
+                    WHERE u.login = %s
+                    """,
+                    (login,),
+                )
+                return cur.fetchone()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _check_password(password: str, password_hash: str) -> bool:
+        try:
+            return password == password_hash
+        except ValueError:
+            # В базе лежит строка, которая не является настоящим bcrypt-хешем
+            return False
+
+    def _login(self):
+        login = self.login_input.text().strip()
+        password = self.password_input.text()
+
+        if not login or not password:
+            self.error_label.setText("Введите логин и пароль")
+            return
+
+        try:
+            user = self._find_user(login)
+        except Exception:
+            self.error_label.setText("Не удалось подключиться к базе данных")
+            return
+
+        if user is None:
+            self.error_label.setText("Пользователь с таким логином не найден")
+            return
+
+        if not self._check_password(password, user["password_hash"]):
+            self.error_label.setText("Неверный пароль")
+            return
+
+        self.reset()
+        self.on_success({
+            "user_id": user["user_id"],
+            "login": user["login"],
+            "full_name": user["full_name"],
+            "role_name": user["role_name"],
+        })
+
+    def _login_as_guest(self):
+        self.reset()
+        self.on_success({
+            "user_id": None,
+            "login": None,
+            "full_name": "Гость",
+            "role_name": "guest",
+        })
+################screens\__init__.py
+
+################
+regiect/ main. 
+db.py 
+styles 
+data/
+init＿.ру
+products_repo.py
+screens/
+init＿. ру
+login_screen.py 
+products_screen.py
+ product_list_page.py 
+ product_form_page.py
+
+
